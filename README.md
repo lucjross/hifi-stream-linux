@@ -31,19 +31,31 @@ The installer checks these and prints the exact `apt` command for anything missi
 ## Install
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/lucjross/wiim-stream/main/install.sh | bash
+```
+
+Or from a clone:
+
+```sh
 git clone https://github.com/lucjross/wiim-stream.git
 cd wiim-stream
 ./install.sh
 ```
 
-This copies the app to `~/.local/bin/wiim-stream` and sets it up as a systemd user service
-that starts at login. Then:
+Either way, this copies the app to `~/.local/bin/wiim-stream` and sets it up as a systemd
+user service that starts at login. Nothing needs root, apart from installing any missing
+dependencies. Then:
 
 1. Click the speaker icon in the top bar and pick your WiiM.
 2. Choose **WiiM (24-bit FLAC stream)** as the sound output (Settings → Sound).
 3. Play something. The WiiM starts within a couple of seconds.
 
-To update, pull and run `./install.sh` again. To remove: `./install.sh --uninstall`.
+To update, run the same install command again. To remove:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/lucjross/wiim-stream/main/install.sh | bash -s -- --uninstall
+# or, from a clone: ./install.sh --uninstall
+```
 
 ## Settings
 
