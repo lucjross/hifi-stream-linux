@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""wiim-stream: play desktop audio on a network player as a live lossless FLAC stream.
+"""hifi-stream: play desktop audio on a network player as a live lossless FLAC stream.
 
 Creates a virtual PipeWire output. Whatever plays to it is captured, encoded to FLAC and
 served over HTTP, and the player picked in the tray menu is told to play that URL. Kinds
 of player are backends; WiiM (LinkPlay) is built in, and more can be added as plugins.
 
-  wiim-stream app                tray app: virtual output, stream server, auto-start (default)
-  wiim-stream serve              virtual output and stream server only, no tray
-  wiim-stream play ADDRESS...    point players at the stream once
+  hifi-stream app                tray app: virtual output, stream server, auto-start (default)
+  hifi-stream serve              virtual output and stream server only, no tray
+  hifi-stream play ADDRESS...    point players at the stream once
 
-Settings live in ~/.config/wiim-stream/config.json (written with defaults on first run),
-backend plugins in ~/.config/wiim-stream/backends/*.py.
+Settings live in ~/.config/hifi-stream/config.json (written with defaults on first run),
+backend plugins in ~/.config/hifi-stream/backends/*.py.
 """
 import argparse
 import json
@@ -28,16 +28,17 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP = "wiim-stream"
+APP = "hifi-stream"
 UNIT = f"{APP}.service"
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP / "config.json"
 STATE_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / APP / "state.json"
 PLUGIN_DIR = CONFIG_PATH.parent / "backends"
+AUTOSTART_PATH = CONFIG_PATH.parent.parent / "autostart" / f"{APP}.desktop"
 
 DEFAULTS = {
     "port": 8765,
-    "sink_name": "wiim_stream",
-    "sink_description": "",        # empty = "WiiM (24-bit FLAC stream)"
+    "sink_name": "hifi_stream",
+    "sink_description": "",        # empty = "Hi-fi stream (24-bit FLAC)"
     "sample_rate": 44100,          # Spotify's native rate; anything else means resampling
     "bit_depth": 24,               # 16 or 24
     "idle_release_minutes": 5,     # stop the player after this long without audio; 0 = never
@@ -57,7 +58,7 @@ def load_config():
     cfg = {**DEFAULTS, **read_json(CONFIG_PATH)}
     if cfg["bit_depth"] not in (16, 24):
         sys.exit(f"{CONFIG_PATH}: bit_depth must be 16 or 24")
-    cfg["sink_description"] = cfg["sink_description"] or f"WiiM ({cfg['bit_depth']}-bit FLAC stream)"
+    cfg["sink_description"] = cfg["sink_description"] or f"Hi-fi stream ({cfg['bit_depth']}-bit FLAC)"
     return cfg
 
 
@@ -95,7 +96,7 @@ def ensure_sink(cfg):
         "audio.rate": cfg["sample_rate"],
         "monitor.channel-volumes": True,   # the desktop volume slider applies to the stream
         "object.linger": True,             # outlive pw-cli, and this app across restarts
-        "wiim_stream.managed": True,       # lets the uninstaller find it
+        "hifi_stream.managed": True,       # lets the uninstaller find it
     }
     node = find_node(pw_dump(), cfg["sink_name"])
     if node:
@@ -194,7 +195,7 @@ class Backend:
     """A kind of network player that can be told to play an HTTP URL.
 
     To support another kind (UPnP/DLNA, Cast, ...), subclass this and decorate it with
-    @register, either in this file or in a plugin file in ~/.config/wiim-stream/backends/,
+    @register, either in this file or in a plugin file in ~/.config/hifi-stream/backends/,
     where Backend and register are predefined. Addresses are whatever the backend needs to
     reach a player, as written in the "devices" setting or returned by discover().
     """
@@ -425,6 +426,26 @@ def systemctl(*args):
     return subprocess.run(["systemctl", "--user", *args, UNIT], capture_output=True, text=True)
 
 
+def autostart_state():
+    """"enabled" or "disabled" for however install.sh set up starting at login (a systemd
+    user service, or an XDG autostart entry where there's no systemd graphical session),
+    or None when it didn't."""
+    state = systemctl("is-enabled").stdout.strip()
+    if state in ("enabled", "disabled"):
+        return state
+    if AUTOSTART_PATH.exists():
+        return "disabled" if "Hidden=true" in AUTOSTART_PATH.read_text().splitlines() else "enabled"
+    return None
+
+
+def set_autostart(on):
+    if systemctl("is-enabled").stdout.strip() in ("enabled", "disabled"):
+        systemctl("enable" if on else "disable")
+    elif AUTOSTART_PATH.exists():
+        lines = [l for l in AUTOSTART_PATH.read_text().splitlines() if not l.startswith("Hidden=")]
+        AUTOSTART_PATH.write_text("\n".join(lines + ([] if on else ["Hidden=true"])) + "\n")
+
+
 def run_tray(ctl):
     import gi
     gi.require_version("Gtk", "3.0")
@@ -441,7 +462,7 @@ def run_tray(ctl):
     if repo_icons.is_dir():
         ind.set_icon_theme_path(str(repo_icons))
     ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
-    ind.set_title("WiiM stream")
+    ind.set_title("Hi-fi stream")
     shown = {}
 
     def item(menu, label, action):
@@ -454,7 +475,7 @@ def run_tray(ctl):
             ctl.select(name)
 
     def on_autostart(it):
-        systemctl("enable" if it.get_active() else "disable")
+        set_autostart(it.get_active())
 
     def restart():
         os.execv(sys.executable, [sys.executable, *sys.argv])
@@ -478,8 +499,8 @@ def run_tray(ctl):
         menu.append(shown["status"])
         item(menu, "Rescan for devices", ctl.rescan)
         menu.append(Gtk.SeparatorMenuItem())
-        enabled = systemctl("is-enabled").stdout.strip()
-        if enabled in ("enabled", "disabled"):  # only when installed as a service
+        enabled = autostart_state()
+        if enabled:  # only when installed
             auto = Gtk.CheckMenuItem(label="Start at login")
             auto.set_active(enabled == "enabled")
             auto.connect("toggled", on_autostart)

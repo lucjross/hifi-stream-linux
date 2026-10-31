@@ -1,6 +1,6 @@
-"""Generate icons/wiim-stream-symbolic.svg: a disc with a tilted, tapering W knocked out.
+"""Generate icons/hifi-stream-symbolic.svg: a disc with a tilted, tapering W knocked out.
 
-  python3 icons/make_icon.py icons/wiim-stream-symbolic.svg
+  python3 icons/make_icon.py icons/hifi-stream-symbolic.svg
 """
 import math, sys
 
