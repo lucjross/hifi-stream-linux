@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""wiim-stream: play Linux desktop audio on a WiiM as a live lossless FLAC stream.
+"""wiim-stream: play desktop audio on a network player as a live lossless FLAC stream.
 
-Creates a virtual PipeWire output. Whatever plays to it (e.g. the Spotify desktop app,
-Mix transitions included) is captured, encoded to 24-bit FLAC and streamed over HTTP to
-the WiiM picked in the tray menu. To play on several WiiMs, group them in the WiiM Home
-app and pick the group leader.
+Creates a virtual PipeWire output. Whatever plays to it is captured, encoded to FLAC and
+served over HTTP, and the player picked in the tray menu is told to play that URL. Kinds
+of player are backends; WiiM (LinkPlay) is built in, and more can be added as plugins.
 
-  wiim-stream app          tray app: virtual output, stream server, auto-start (default)
-  wiim-stream serve        virtual output and stream server only, no tray
-  wiim-stream play IP...   point WiiMs at the stream once
+  wiim-stream app                tray app: virtual output, stream server, auto-start (default)
+  wiim-stream serve              virtual output and stream server only, no tray
+  wiim-stream play ADDRESS...    point players at the stream once
 
-Settings live in ~/.config/wiim-stream/config.json (written with defaults on first run).
+Settings live in ~/.config/wiim-stream/config.json (written with defaults on first run),
+backend plugins in ~/.config/wiim-stream/backends/*.py.
 """
 import argparse
 import json
 import os
 import re
+import runpy
 import socket
 import ssl
 import subprocess
@@ -31,6 +32,7 @@ APP = "wiim-stream"
 UNIT = f"{APP}.service"
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP / "config.json"
 STATE_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / APP / "state.json"
+PLUGIN_DIR = CONFIG_PATH.parent / "backends"
 
 DEFAULTS = {
     "port": 8765,
@@ -38,8 +40,9 @@ DEFAULTS = {
     "sink_description": "",        # empty = "WiiM (24-bit FLAC stream)"
     "sample_rate": 44100,          # Spotify's native rate; anything else means resampling
     "bit_depth": 24,               # 16 or 24
-    "idle_release_minutes": 5,     # stop the WiiM after this long without audio; 0 = never
-    "devices": {},                 # extra WiiMs as {"name": "ip"}, if discovery misses them
+    "idle_release_minutes": 5,     # stop the player after this long without audio; 0 = never
+    "devices": {},                 # players discovery misses: {"name": "ip"} for a WiiM, or
+                                   # {"name": {"backend": "...", "address": "..."}}
 }
 
 SCAN_SECS = 60
@@ -176,6 +179,57 @@ class Handler(BaseHTTPRequestHandler):
         print(f"{self.client_address[0]} {fmt % args}", file=sys.stderr)
 
 
+# --- backends ---------------------------------------------------------------------------
+
+BACKENDS = {}   # name -> Backend instance
+
+
+def register(cls):
+    """Class decorator that makes a Backend available."""
+    BACKENDS[cls.name] = cls()
+    return cls
+
+
+class Backend:
+    """A kind of network player that can be told to play an HTTP URL.
+
+    To support another kind (UPnP/DLNA, Cast, ...), subclass this and decorate it with
+    @register, either in this file or in a plugin file in ~/.config/wiim-stream/backends/,
+    where Backend and register are predefined. Addresses are whatever the backend needs to
+    reach a player, as written in the "devices" setting or returned by discover().
+    """
+    name = ""       # id used in settings and state, e.g. "wiim"
+    label = ""      # shown in the menu when several backends are loaded, e.g. "WiiM"
+
+    def discover(self):
+        """Return {display name: address} of players found on the network."""
+        return {}
+
+    def play(self, address, url):
+        raise NotImplementedError
+
+    def stop(self, address):
+        raise NotImplementedError
+
+    def host(self, address):
+        """The IP the player fetches the stream from, used to tell when it's connected."""
+        return socket.gethostbyname(address)
+
+
+def load_plugins():
+    for path in sorted(PLUGIN_DIR.glob("*.py")):
+        try:
+            runpy.run_path(str(path), init_globals={"Backend": Backend, "register": register})
+        except Exception as e:
+            print(f"{path}: {e}", file=sys.stderr)
+
+
+def stream_url(host, port):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((host, 80))  # no packets sent; just picks the interface that reaches host
+        return f"http://{s.getsockname()[0]}:{port}/stream.flac"
+
+
 # --- WiiM -------------------------------------------------------------------------------
 
 def wiim_cmd(host, command, timeout=5):
@@ -185,43 +239,57 @@ def wiim_cmd(host, command, timeout=5):
         return r.read().decode()
 
 
-def stream_url(host, port):
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.connect((host, 80))  # no packets sent; just picks the interface that reaches host
-        return f"http://{s.getsockname()[0]}:{port}/stream.flac"
+@register
+class WiiM(Backend):
+    """WiiM and other LinkPlay-based players, via their HTTP API. To play on several,
+    group them in the WiiM Home app and pick the group leader."""
+    name = "wiim"
+    label = "WiiM"
+
+    def discover(self):
+        """mDNS, plus each player's group followers, which don't always answer mDNS."""
+        found = {}
+        out = subprocess.run(["avahi-browse", "-rtp", "_linkplay._tcp"],
+                             capture_output=True, text=True, timeout=15).stdout
+        for line in out.splitlines():
+            f = line.split(";")
+            if len(f) > 7 and f[0] == "=" and f[2] == "IPv4":
+                name = re.sub(r"\\(\d{3})", lambda m: chr(int(m[1])), f[3])
+                found[re.sub(r"\\(.)", r"\1", name)] = f[7]
+        for ip in list(found.values()):
+            try:
+                for s in json.loads(wiim_cmd(ip, "multiroom:getSlaveList", 3)).get("slave_list", []):
+                    found.setdefault(s["name"], s["ip"])
+            except Exception:
+                pass
+        return found
+
+    def play(self, address, url):
+        wiim_cmd(address, f"setPlayerCmd:play:{url}")
+
+    def stop(self, address):
+        wiim_cmd(address, "setPlayerCmd:stop")
 
 
-def discover():
-    """Return {name: ip} of WiiMs (and other LinkPlay devices) on the network, via mDNS
-    plus each one's group followers, which don't always answer mDNS."""
-    found = {}
-    out = subprocess.run(["avahi-browse", "-rtp", "_linkplay._tcp"],
-                         capture_output=True, text=True, timeout=15).stdout
-    for line in out.splitlines():
-        f = line.split(";")
-        if len(f) > 7 and f[0] == "=" and f[2] == "IPv4":
-            name = re.sub(r"\\(\d{3})", lambda m: chr(int(m[1])), f[3])
-            found[re.sub(r"\\(.)", r"\1", name)] = f[7]
-    for ip in list(found.values()):
-        try:
-            for s in json.loads(wiim_cmd(ip, "multiroom:getSlaveList", 3)).get("slave_list", []):
-                found.setdefault(s["name"], s["ip"])
-        except Exception:
-            pass
-    return found
+def parse_device(entry):
+    """A device entry from settings or state: "address" (a WiiM), or
+    {"backend": "...", "address": "..."}. Returns (backend name, address)."""
+    if isinstance(entry, str):
+        return "wiim", entry
+    return entry.get("backend", "wiim"), entry["address"]
 
 
 # --- controller -------------------------------------------------------------------------
 
 class Controller:
-    """Starts the selected WiiM when audio starts playing into the sink, and releases it
-    after a long silence. It only takes the WiiM over when playback starts, so switching
-    the WiiM to another source isn't undone while the desktop keeps playing."""
+    """Starts the selected player when audio starts playing into the sink, and releases it
+    after a long silence. It only takes the player over when playback starts, so switching
+    the player to another source isn't undone while the desktop keeps playing."""
 
     def __init__(self, cfg):
         self.cfg = cfg
         state = read_json(STATE_PATH)
-        self.discovered = state.get("discovered", {})
+        self.discovered = {n: parse_device(e) for n, e in state.get("discovered", {}).items()}
         self.selected = state.get("selected")
         self.clients = {}            # ip -> open stream connections
         self.active = False
@@ -234,10 +302,17 @@ class Controller:
 
     @property
     def devices(self):
-        return {**self.discovered, **self.cfg["devices"]}
+        """{name: (backend name, address)} for every player with a loaded backend."""
+        configured = {n: parse_device(e) for n, e in self.cfg["devices"].items()}
+        return {n: d for n, d in {**self.discovered, **configured}.items() if d[0] in BACKENDS}
+
+    def _device(self, name):
+        d = self.devices.get(name)
+        return d and (BACKENDS[d[0]], d[1])
 
     def _save(self):
-        write_json(STATE_PATH, {"selected": self.selected, "discovered": self.discovered})
+        discovered = {n: {"backend": b, "address": a} for n, (b, a) in self.discovered.items()}
+        write_json(STATE_PATH, {"selected": self.selected, "discovered": discovered})
 
     def client_changed(self, ip, delta):
         with self.lock:
@@ -260,28 +335,37 @@ class Controller:
         self.last_scan = 0
         self.wake.set()
 
-    def _streaming_to(self, ip):
+    def _streaming_to(self, dev):
+        backend, address = dev
+        try:
+            ip = backend.host(address)
+        except OSError:
+            return False
         with self.lock:
             return ip in self.clients
 
-    def _send(self, ip, command):
+    def _call(self, what, fn):
         try:
-            wiim_cmd(ip, command)
+            fn()
         except Exception as e:
-            print(f"{ip} {command}: {e}", file=sys.stderr)
+            print(f"{what}: {e}", file=sys.stderr)
 
-    def _start(self, ip):
-        self._send(ip, f"setPlayerCmd:play:{stream_url(ip, self.cfg['port'])}")
+    def _start(self, dev):
+        backend, address = dev
+        self._call(f"{backend.name} {address} play",
+                   lambda: backend.play(address, stream_url(backend.host(address), self.cfg["port"])))
 
-    def _stop(self, ip):
-        self._send(ip, "setPlayerCmd:stop")
+    def _stop(self, dev):
+        backend, address = dev
+        self._call(f"{backend.name} {address} stop", lambda: backend.stop(address))
 
     def _scan(self):
-        try:
-            self.discovered.update(discover())
-            self._save()
-        except Exception as e:
-            print(f"discovery: {e}", file=sys.stderr)
+        for backend in BACKENDS.values():
+            try:
+                self.discovered.update({n: (backend.name, a) for n, a in backend.discover().items()})
+            except Exception as e:
+                print(f"{backend.name} discovery: {e}", file=sys.stderr)
+        self._save()
         self.last_scan = time.monotonic()
 
     def _tick(self, idle_since):
@@ -300,27 +384,27 @@ class Controller:
 
         with self.lock:
             pending, self.pending = self.pending, None
-        ip = self.devices.get(self.selected)
+        dev = self._device(self.selected)
         idle_limit = self.cfg["idle_release_minutes"] * 60
         if pending:
-            old_ip = self.devices.get(pending[0])
-            was_streaming = bool(old_ip) and self._streaming_to(old_ip)
-            if was_streaming and old_ip != ip:
-                self._stop(old_ip)
-            if ip and (active or was_streaming) and not self._streaming_to(ip):
-                self._start(ip)
-        elif started and ip and not self._streaming_to(ip):
-            self._start(ip)
-        elif not active and ip and idle_limit and self._streaming_to(ip) and now - idle_since > idle_limit:
-            self._stop(ip)
+            old = self._device(pending[0])
+            was_streaming = bool(old) and self._streaming_to(old)
+            if was_streaming and old != dev:
+                self._stop(old)
+            if dev and (active or was_streaming) and not self._streaming_to(dev):
+                self._start(dev)
+        elif started and dev and not self._streaming_to(dev):
+            self._start(dev)
+        elif not active and dev and idle_limit and self._streaming_to(dev) and now - idle_since > idle_limit:
+            self._stop(dev)
 
         fmt = f"{self.cfg['bit_depth']}-bit/{self.cfg['sample_rate'] / 1000:g}kHz"
         if not self.selected:
             self.status = "Off"
-        elif ip and self._streaming_to(ip):
+        elif dev and self._streaming_to(dev):
             self.status = f"Streaming {fmt}" if active else "Connected, nothing playing"
         elif active:
-            self.status = "Not playing on the WiiM"
+            self.status = f"Not playing on {self.selected}"
         else:
             self.status = "Waiting for audio"
         for cb in self.listeners:
@@ -378,8 +462,12 @@ def run_tray(ctl):
     def build():
         menu = Gtk.Menu()
         group = None
-        for name in [None, *sorted(ctl.devices)]:
-            it = Gtk.RadioMenuItem.new_with_label_from_widget(group, name or "Off")
+        devices = ctl.devices
+        for name in [None, *sorted(devices)]:
+            label = name or "Off"
+            if name and len(BACKENDS) > 1:
+                label += f" ({BACKENDS[devices[name][0]].label})"
+            it = Gtk.RadioMenuItem.new_with_label_from_widget(group, label)
             group = it
             it.set_active(name == ctl.selected)
             it.connect("toggled", on_pick, name)
@@ -388,7 +476,7 @@ def run_tray(ctl):
         shown["status"] = Gtk.MenuItem(label=ctl.status)
         shown["status"].set_sensitive(False)
         menu.append(shown["status"])
-        item(menu, "Rescan for WiiMs", ctl.rescan)
+        item(menu, "Rescan for devices", ctl.rescan)
         menu.append(Gtk.SeparatorMenuItem())
         enabled = systemctl("is-enabled").stdout.strip()
         if enabled in ("enabled", "disabled"):  # only when installed as a service
@@ -422,14 +510,19 @@ def main():
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("app", help="tray app (default)")
     sub.add_parser("serve", help="virtual output and stream server, no tray")
-    p = sub.add_parser("play", help="point WiiMs at the stream once")
-    p.add_argument("hosts", nargs="+")
+    p = sub.add_parser("play", help="point players at the stream once")
+    p.add_argument("--backend", default="wiim", help="kind of player (default: wiim)")
+    p.add_argument("addresses", nargs="+")
     args = ap.parse_args()
     cfg = load_config()
+    load_plugins()
 
     if args.cmd == "play":
-        for host in args.hosts:
-            print(host, wiim_cmd(host, f"setPlayerCmd:play:{stream_url(host, cfg['port'])}"))
+        if args.backend not in BACKENDS:
+            sys.exit(f"unknown backend {args.backend!r}; loaded: {', '.join(BACKENDS)}")
+        backend = BACKENDS[args.backend]
+        for address in args.addresses:
+            backend.play(address, stream_url(backend.host(address), cfg["port"]))
         return
 
     allow_rate(cfg["sample_rate"])

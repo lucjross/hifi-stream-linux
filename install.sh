@@ -72,7 +72,7 @@ install_app() {
     mkdir -p "$UNIT_DIR"
     cat > "$UNIT" <<EOF
 [Unit]
-Description=wiim-stream: play desktop audio on a WiiM as lossless FLAC
+Description=wiim-stream: play desktop audio on a network player as lossless FLAC
 PartOf=graphical-session.target
 After=graphical-session.target pipewire.service pipewire-pulse.service
 
@@ -88,7 +88,7 @@ EOF
     systemctl --user enable wiim-stream.service
     systemctl --user restart wiim-stream.service
 
-    echo "Installed. Click the W icon in the top bar and pick your WiiM, then choose"
+    echo "Installed. Click the W icon in the top bar and pick your player, then choose"
     echo "\"WiiM (24-bit FLAC stream)\" as the sound output and play something."
 }
 
