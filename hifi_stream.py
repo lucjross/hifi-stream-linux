@@ -141,6 +141,9 @@ def capture_pipeline(cfg):
          "-i", f"{cfg['sink_name']}.monitor",
          "-c:a", "flac", *depth, "-compression_level", "0", "-flush_packets", "1", "-f", "flac", "pipe:1"],
         stdout=subprocess.PIPE,
+        # Pin the capture to our sink: otherwise WirePlumber moves it to the new default
+        # sink's monitor when the user switches outputs, and the player plays that instead.
+        env={**os.environ, "PULSE_PROP": "node.dont-move=true"},
     )
 
 
